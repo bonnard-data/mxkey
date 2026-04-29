@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://mxkey.space">
-    <img src="./assets/key.png" alt="mxkey" width="120" height="120" />
+    <img src="./assets/icon.png" alt="mxkey" width="120" height="120" />
   </a>
 </p>
 
