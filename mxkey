@@ -1,0 +1,754 @@
+#!/usr/bin/env bash
+#
+# mxkey — macOS Keychain wrapper for dev secrets
+# ───────────────────────────────────────────────
+#
+# mxkey stores secrets in macOS Keychain (encrypted, tied to your login)
+# and injects them into one command's environment, then disappears.
+#
+# Three ideas to understand:
+#
+#   1. Keychain is the vault. /usr/bin/security (ships with macOS) reads and
+#      writes it. mxkey is a thin wrapper that adds a naming convention
+#      (mxkey.*) and an env-var mapping.
+#
+#   2. Groups are just a naming prefix. "project.myapp.stripe" and
+#      "project.myapp.openai" form a group because they share the prefix
+#      "project.myapp". Running `mxkey run project.myapp -- <cmd>` loads both.
+#
+#   3. `run` uses `exec /usr/bin/env KEY=value <cmd>`. This REPLACES mxkey's
+#      process with <cmd>, injecting the secret as an environment variable.
+#      The secret never touches the command line, shell history, or disk.
+#
+# Storage layout
+# ──────────────
+# Each secret is a Keychain "generic password" entry:
+#   service:  mxkey.<category>.<name>   e.g. mxkey.api.openai
+#   account:  <ENV_VAR_NAME>            e.g. OPENAI_API_KEY
+#   password: the secret value
+#
+# An on-disk index at ~/.config/mxkey/index keeps name -> env-var mappings,
+# so listing and bulk operations don't need to parse `security dump-keychain`.
+# The index contains NO secret values — just names and their env-var names.
+#
+# Categories (convention only, not enforced): api, db, oauth, project, infra
+#
+# See SKILL.md, README.md, and references/ for usage guidance.
+
+set -euo pipefail
+
+# Tighten default file perms for anything we create.
+# The index holds names (no values), but fewer prying eyes is still better.
+umask 077
+
+MXKEY_VERSION="0.6.0"
+PREFIX="mxkey"
+SEC=/usr/bin/security
+INDEX_DIR="$HOME/.config/mxkey"
+INDEX="$INDEX_DIR/index"
+MANIFEST=".env.mxkey"
+
+mkdir -p "$INDEX_DIR"
+chmod 700 "$INDEX_DIR" 2>/dev/null || true
+touch "$INDEX"
+chmod 600 "$INDEX" 2>/dev/null || true
+
+usage() {
+  cat >&2 <<'EOF'
+mxkey — Save API keys in your Mac's Keychain. Use them in commands without ever typing them.
+
+Save a new secret
+  mxkey set [--require-auth] <name> <ENV_VAR>
+      Save (or update) a secret. Asks for the value at a hidden prompt.
+      Example: mxkey set api.groq GROQ_API_KEY
+
+      With --require-auth, every `mxkey run` that uses this secret triggers
+      a macOS confirmation dialog (with Touch ID as a shortcut on eligible
+      Macs). Good for high-value keys; low-friction Touch ID tap.
+
+Use it in a command
+  mxkey run <name>... -- <command>
+      Run a command with those secrets loaded as environment variables.
+      A name without an exact match acts as a group prefix — so
+      "project.myapp" loads every project.myapp.* secret at once.
+      Example: mxkey run api.groq -- curl https://api.groq.com/...
+      Example: mxkey run project.myapp -- pnpm dev
+
+Project workflow
+  mxkey init <group-prefix>
+      Write a .env.mxkey manifest in the current folder listing every
+      secret that matches <group-prefix>. No values, just names — safe to
+      share. Example: mxkey init project.myapp
+
+  mxkey run-here -- <command>
+      Find the nearest .env.mxkey (walking up from the current folder)
+      and run <command> with every secret it lists loaded.
+      Example: mxkey run-here -- pnpm dev
+
+Inspect and clean up
+  mxkey list [prefix]         Show stored secret names (values stay hidden).
+                              Optionally filter by a group prefix.
+  mxkey get <name>            Print a secret value to stdout. Use sparingly.
+  mxkey rm <name>             Delete a secret from Keychain.
+  mxkey export <name>         Print "ENV_VAR=value" for shell sourcing.
+                              Prefer `run` where possible.
+
+Backup / recovery codes (single-use)
+  mxkey backup add [--show] <service>
+                                 Add codes at a prompt (one per line, blank
+                                 line ends input). Hidden by default; pass
+                                 --show to echo input. Stored under
+                                 backup.<service>.<n>, always require-auth.
+  mxkey backup use <service>     Print and delete the next available code.
+                                 Single-use: the code is consumed atomically.
+  mxkey backup list [service]    Show how many codes remain (no values).
+  mxkey backup rm <service>      Delete all codes for a service.
+
+Naming convention: <category>.<name>
+Categories (convention): api, db, oauth, project, infra, backup
+EOF
+  exit "${1:-0}"
+}
+
+# ── index helpers ──────────────────────────────────────────────────────────
+
+svc_for() { printf '%s.%s\n' "$PREFIX" "$1"; }
+
+# index_lookup <name> — print the env-var name for <name> on stdout.
+# Returns non-zero if <name> isn't in the index.
+index_lookup() {
+  awk -v n="$1" -F'\t' '$1==n {print $2; found=1; exit} END {exit !found}' "$INDEX"
+}
+
+# index_upsert <name> <env-var> — insert or replace the mapping.
+index_upsert() {
+  local name="$1" envvar="$2" tmp
+  tmp=$(mktemp)
+  awk -v n="$name" -v e="$envvar" -F'\t' -v OFS='\t' '
+    $1==n {found=1; print n, e; next}
+    {print}
+    END {if (!found) print n, e}
+  ' "$INDEX" > "$tmp"
+  mv "$tmp" "$INDEX"
+}
+
+# index_remove <name> — drop the mapping for <name>.
+index_remove() {
+  local tmp
+  tmp=$(mktemp)
+  awk -v n="$1" -F'\t' '$1!=n' "$INDEX" > "$tmp"
+  mv "$tmp" "$INDEX"
+}
+
+# index_match_group <prefix> — print names matching <prefix> exactly OR
+# starting with <prefix>. (e.g. "project.myapp" matches itself AND
+# "project.myapp.stripe", but NOT "project.myappextras.foo").
+index_match_group() {
+  local prefix="$1"
+  awk -v p="$prefix" -F'\t' '
+    $1==p || index($1, p ".")==1 {print $1}
+  ' "$INDEX"
+}
+
+# find_value <service> — fetch a value from Keychain and print it to stdout.
+# Returns non-zero if the entry is missing.
+#
+# Uses `security -g` rather than `-w` because `-w` emits values as hex-encoded
+# bytes whenever the value contains non-printable-ASCII characters (newlines,
+# tabs, any Unicode). `-g` outputs a structured "password: 0xHEX \"escaped\""
+# line for binary/non-ASCII values and `password: \"text\"` for plain ASCII —
+# which lets us decode reliably regardless of content.
+find_value() {
+  local svc="$1"
+  local line
+  line=$("$SEC" find-generic-password -g -s "$svc" 2>&1 >/dev/null | grep '^password:' | head -1) || return 1
+  [[ -n "$line" ]] || return 1
+
+  # Binary / non-ASCII: use the hex form (most reliable).
+  if [[ "$line" =~ ^password:\ 0x([0-9A-Fa-f]+) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}" | /usr/bin/xxd -r -p
+    return 0
+  fi
+
+  # Plain ASCII: text form — `password: "value"` with \" and \\ escaped.
+  if [[ "$line" =~ ^password:\ \"(.*)\"$ ]]; then
+    local val="${BASH_REMATCH[1]}"
+    # Unescape in the right order: \\ first (so \\\" doesn't get double-processed),
+    # then \". Any other escapes would have triggered the hex form above.
+    val="${val//\\\\/\\}"
+    val="${val//\\\"/\"}"
+    printf '%s' "$val"
+    return 0
+  fi
+
+  # Unknown format — can't happen with current macOS security, but bail cleanly.
+  return 1
+}
+
+# ── subcommands ────────────────────────────────────────────────────────────
+
+# `set` — save a secret to Keychain and remember its env-var name.
+# Prompts interactively (hidden input) when stdin is a terminal;
+# reads the whole stdin when called via a pipe (used by migrate-env.sh).
+#
+# With --require-auth, the Keychain ACL is left restrictive (no -T flag),
+# so every subsequent read triggers a macOS confirmation dialog. On Macs
+# with Touch ID, the dialog accepts a fingerprint tap as approval.
+cmd_set() {
+  local require_auth=0
+  while [[ $# -gt 0 && "$1" == --* ]]; do
+    case "$1" in
+      --require-auth) require_auth=1; shift ;;
+      --) shift; break ;;
+      *) echo "error: unknown flag $1" >&2; exit 2 ;;
+    esac
+  done
+
+  [[ $# -ge 2 ]] || { echo "usage: mxkey set [--require-auth] <name> <ENV_VAR>" >&2; exit 2; }
+  local name="$1" envvar="$2"
+  if [[ -z "$name" || "$name" == *[[:space:]]* || "$name" == *[[:cntrl:]]* ]]; then
+    echo "error: name must not be empty or contain whitespace/control characters" >&2
+    exit 2
+  fi
+  local svc
+  svc=$(svc_for "$name")
+
+  local value
+  if [[ -t 0 ]]; then
+    # Interactive: hidden prompt.
+    printf 'Value for %s (input hidden): ' "$svc" >&2
+    IFS= read -rs value
+    printf '\n' >&2
+  else
+    # Piped in: read the entire stdin as the value. `cat` is used instead
+    # of `read` so values without a trailing newline (common with printf)
+    # and multiline values (e.g. PEM keys) both work correctly.
+    value=$(cat)
+  fi
+  [[ -n "$value" ]] || { echo "error: empty value" >&2; exit 2; }
+
+  # Build the security command. Omit -T when --require-auth is set — that
+  # leaves every read prompted by macOS. Otherwise, pre-authorize the
+  # `security` binary so scripted reads are silent.
+  local -a sec_args=(
+    add-generic-password
+    -s "$svc"
+    -a "$envvar"
+    -w "$value"
+    -U
+  )
+  if [[ $require_auth -eq 0 ]]; then
+    sec_args+=(-T /usr/bin/security)
+  fi
+
+  "$SEC" "${sec_args[@]}"
+  index_upsert "$name" "$envvar"
+  if [[ $require_auth -eq 1 ]]; then
+    echo "set $svc ($envvar) — requires authentication on every read" >&2
+  else
+    echo "set $svc ($envvar)" >&2
+  fi
+}
+
+# `get` — print a single secret's value to stdout. Intended as an escape
+# hatch for rare cases; prefer `run` to avoid the value touching the shell.
+cmd_get() {
+  [[ $# -ge 1 ]] || { echo "usage: mxkey get <name>" >&2; exit 2; }
+  local svc
+  svc=$(svc_for "$1")
+  find_value "$svc" || {
+    echo "error: $svc not found" >&2; exit 1;
+  }
+}
+
+# `rm` — delete a secret from Keychain and the index. Silently succeeds if
+# the entry wasn't there (so repeat-calls are safe).
+#
+# On an interactive terminal, prompts "Remove X? [y/N]" before deleting.
+# `-f` / `--force` skips the prompt. Non-TTY stdin skips the prompt too
+# (script context — no way to answer).
+cmd_rm() {
+  local force=0
+  while [[ $# -gt 0 && "$1" == -* ]]; do
+    case "$1" in
+      -f|--force) force=1; shift ;;
+      --) shift; break ;;
+      *) echo "error: unknown flag $1" >&2; exit 2 ;;
+    esac
+  done
+  [[ $# -ge 1 ]] || { echo "usage: mxkey rm [-f|--force] <name>" >&2; exit 2; }
+  local name="$1"
+  local svc
+  svc=$(svc_for "$name")
+
+  if [[ $force -eq 0 && -t 0 ]]; then
+    local envvar="" label="$svc"
+    if envvar=$(index_lookup "$name" 2>/dev/null); then
+      label="$svc ($envvar)"
+    fi
+    printf 'Remove %s? [y/N] ' "$label" >&2
+    local ans
+    read -r ans
+    [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "Aborted." >&2; exit 0; }
+  fi
+
+  "$SEC" delete-generic-password -s "$svc" >/dev/null 2>&1 || true
+  index_remove "$name"
+  echo "removed $svc" >&2
+}
+
+# `list` — show the stored names (and their env-var names). Values are never
+# printed. Accepts an optional group prefix to filter.
+cmd_list() {
+  local filter="${1:-}"
+  if [[ ! -s "$INDEX" ]]; then
+    echo "(no secrets stored)" >&2
+    return 0
+  fi
+  printf '%-40s  %s\n' NAME ENV_VAR
+  printf '%-40s  %s\n' "----------------------------------------" "------------------------------"
+  if [[ -n "$filter" ]]; then
+    awk -v p="$filter" -F'\t' '
+      $1==p || index($1, p ".")==1 {printf "%-40s  %s\n", $1, $2}
+    ' "$INDEX" | sort
+  else
+    awk -F'\t' '{printf "%-40s  %s\n", $1, $2}' "$INDEX" | sort
+  fi
+}
+
+# resolve_names <names...> — expand group prefixes into exact names.
+# A name that's in the index is passed through as-is. A name that ISN'T
+# in the index is treated as a group prefix and expanded to every matching
+# entry. Errors out if any name has no exact match and no group matches.
+resolve_names() {
+  local -a out=()
+  local name
+  for name in "$@"; do
+    if index_lookup "$name" >/dev/null 2>&1; then
+      out+=("$name")
+    else
+      local -a matches=()
+      while IFS= read -r n; do
+        [[ -n "$n" ]] && matches+=("$n")
+      done < <(index_match_group "$name")
+      if [[ ${#matches[@]} -eq 0 ]]; then
+        echo "error: $name not in index and no entries match $name.*" >&2
+        echo "hint: run 'mxkey list' to see what's stored" >&2
+        exit 1
+      fi
+      out+=("${matches[@]}")
+    fi
+  done
+  printf '%s\n' "${out[@]}"
+}
+
+# `run` — the core operation. Fetch the named secrets from Keychain and
+# exec the given command with each loaded as an environment variable.
+# The secret is handed to `env KEY=value cmd...` and exec replaces mxkey
+# itself, so the value never appears in arguments, shell history, or ps(1).
+cmd_run() {
+  local -a names=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do
+    names+=("$1")
+    shift
+  done
+  [[ "${1:-}" == "--" ]] || { echo "error: expected -- before command" >&2; exit 2; }
+  shift
+  [[ $# -gt 0 ]] || { echo "error: missing command after --" >&2; exit 2; }
+  [[ ${#names[@]} -gt 0 ]] || { echo "error: missing secret name(s) before --" >&2; exit 2; }
+
+  # Expand any group prefixes to concrete names.
+  local -a resolved=()
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && resolved+=("$n")
+  done < <(resolve_names "${names[@]}")
+
+  # Build a flat list of KEY=value env pairs for `env`.
+  local -a env_args=()
+  local name envvar svc val
+  for name in "${resolved[@]}"; do
+    envvar=$(index_lookup "$name")
+    svc=$(svc_for "$name")
+    val=$(find_value "$svc") || {
+      echo "error: $svc not found in keychain" >&2; exit 1;
+    }
+    env_args+=("$envvar=$val")
+  done
+
+  # exec replaces the current process — mxkey is gone, only the child
+  # remains, owning the injected env vars.
+  exec /usr/bin/env "${env_args[@]}" "$@"
+}
+
+# `init` — generate .env.mxkey in the current folder. The manifest is a
+# pointer file: it lists NAMES only (no secret values). The names point
+# back into Keychain; run-here reads this file to know what to inject.
+cmd_init() {
+  [[ $# -ge 1 ]] || { echo "usage: mxkey init <group-prefix>" >&2; exit 2; }
+  local prefix="$1"
+
+  local -a matches=()
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && matches+=("$n")
+  done < <(index_match_group "$prefix")
+
+  if [[ ${#matches[@]} -eq 0 ]]; then
+    echo "error: no entries match $prefix or $prefix.*" >&2
+    echo "hint: run 'mxkey list' to see what's stored" >&2
+    exit 1
+  fi
+
+  if [[ -f "$MANIFEST" ]]; then
+    printf '%s already exists. Overwrite? [y/N] ' "$MANIFEST" >&2
+    local ans
+    read -r ans
+    [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "Aborted." >&2; exit 0; }
+  fi
+
+  {
+    printf '# mxkey manifest for %s\n' "$prefix"
+    printf '# Run: mxkey run-here -- <command>\n'
+    printf '# Regenerate any time with: mxkey init %s\n' "$prefix"
+    printf '\n'
+    local n
+    for n in "${matches[@]}"; do
+      printf '%s\n' "$n"
+    done
+  } > "$MANIFEST"
+
+  echo "wrote $MANIFEST with ${#matches[@]} name(s):" >&2
+  local n
+  for n in "${matches[@]}"; do
+    echo "  $n" >&2
+  done
+}
+
+# `run-here` — walk up from the current folder looking for .env.mxkey.
+# Parse its list of names (# comments and blanks allowed) and hand off to
+# `run`. The "here" in the name = "the nearest .env.mxkey above me".
+cmd_run_here() {
+  [[ "${1:-}" == "--" ]] || { echo "usage: mxkey run-here -- <command>" >&2; exit 2; }
+  shift
+  [[ $# -gt 0 ]] || { echo "error: missing command after --" >&2; exit 2; }
+
+  # Walk up from CWD looking for the manifest.
+  local dir="$PWD" manifest=""
+  while true; do
+    if [[ -f "$dir/$MANIFEST" ]]; then
+      manifest="$dir/$MANIFEST"
+      break
+    fi
+    [[ "$dir" == "/" ]] && break
+    dir=$(dirname "$dir")
+  done
+
+  if [[ -z "$manifest" ]]; then
+    echo "error: no $MANIFEST found from $PWD upwards" >&2
+    echo "hint: run 'mxkey init <group-prefix>' to create one" >&2
+    exit 1
+  fi
+
+  # Parse names: skip blanks and # comments, trim whitespace.
+  local -a names=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    names+=("$line")
+  done < "$manifest"
+
+  [[ ${#names[@]} -gt 0 ]] || {
+    echo "error: $manifest is empty (no names)" >&2; exit 1;
+  }
+
+  cmd_run "${names[@]}" -- "$@"
+}
+
+# `export` — print "ENV_VAR=value" to stdout for shell sourcing. Only useful
+# for tools that can't read env vars from their parent process. Prefer `run`.
+cmd_export() {
+  [[ $# -ge 1 ]] || { echo "usage: mxkey export <name>" >&2; exit 2; }
+  local name="$1" envvar svc val
+  envvar=$(index_lookup "$name") || {
+    echo "error: $name not in index" >&2; exit 1;
+  }
+  svc=$(svc_for "$name")
+  val=$(find_value "$svc") || {
+    echo "error: $svc not found in keychain" >&2; exit 1;
+  }
+  printf '%s=%s\n' "$envvar" "$val"
+}
+
+# ── backup codes ───────────────────────────────────────────────────────────
+#
+# Backup codes (recovery codes) are single-use secrets — once read, they're
+# burned. They're stored as a numbered list:
+#
+#   backup.<service>.<n>   e.g. backup.github.1, backup.github.2, ...
+#
+# Differences from regular secrets:
+#   - always stored with --require-auth (Touch ID on every read)
+#   - `use` reads AND deletes atomically (consumption)
+#   - `add` accepts a multiline paste, one code per line
+#   - `list` shows remaining count, never values
+
+# Validate a service name (used as a path component in backup.<service>.<n>).
+# Must be non-empty, no dots, no whitespace, no control chars.
+backup_validate_service() {
+  local s="$1"
+  if [[ -z "$s" || "$s" == *.* || "$s" == *[[:space:]]* || "$s" == *[[:cntrl:]]* ]]; then
+    echo "error: service must be non-empty, no dots, no whitespace" >&2
+    echo "hint: e.g. github, google, 1password" >&2
+    exit 2
+  fi
+}
+
+# backup_codes_for <service> — print existing code names (backup.<service>.<n>),
+# sorted by numeric index ascending. Empty output if none.
+backup_codes_for() {
+  local service="$1"
+  awk -v p="backup.$service." -F'\t' '
+    index($1, p)==1 {
+      n=substr($1, length(p)+1)
+      if (n ~ /^[0-9]+$/) print n "\t" $1
+    }
+  ' "$INDEX" | sort -n | cut -f2
+}
+
+# backup_next_index <service> — print the next free numeric index.
+backup_next_index() {
+  local service="$1"
+  awk -v p="backup.$service." -F'\t' '
+    index($1, p)==1 {
+      n=substr($1, length(p)+1)
+      if (n ~ /^[0-9]+$/ && n+0 > max) max=n+0
+    }
+    END { print max+1 }
+  ' "$INDEX"
+}
+
+# `backup add` — paste codes at a prompt, one per line, blank to end.
+# Default: input is hidden (consistent with the rest of mxkey).
+# Pass --show to echo input so you can verify what you pasted.
+cmd_backup_add() {
+  local show=0
+  while [[ $# -gt 0 && "$1" == --* ]]; do
+    case "$1" in
+      --show) show=1; shift ;;
+      --) shift; break ;;
+      *) echo "error: unknown flag $1" >&2; exit 2 ;;
+    esac
+  done
+  [[ $# -ge 1 ]] || { echo "usage: mxkey backup add [--show] <service>" >&2; exit 2; }
+  local service="$1"
+  backup_validate_service "$service"
+
+  if [[ ! -t 0 ]]; then
+    echo "error: backup add must be run interactively" >&2
+    exit 2
+  fi
+
+  echo "Paste backup codes for $service, one per line." >&2
+  if [[ $show -eq 1 ]]; then
+    echo "Input is VISIBLE (--show). Press Enter on a blank line to finish." >&2
+  else
+    echo "Input is hidden. Press Enter on a blank line to finish. (--show to echo)" >&2
+  fi
+
+  local -a codes=()
+  local line idx=1
+  while true; do
+    printf 'code %d (blank to finish): ' "$idx" >&2
+    if [[ $show -eq 1 ]]; then
+      IFS= read -r line
+    else
+      IFS= read -rs line
+      printf '\n' >&2
+    fi
+    [[ -z "$line" ]] && break
+    codes+=("$line")
+    idx=$((idx+1))
+  done
+
+  if [[ ${#codes[@]} -eq 0 ]]; then
+    echo "no codes entered, nothing stored" >&2
+    return 0
+  fi
+
+  local next
+  next=$(backup_next_index "$service")
+  local stored=0 envvar svc name code
+  local SERVICE_UC
+  SERVICE_UC=$(printf '%s' "$service" | tr '[:lower:]-' '[:upper:]_')
+  for code in "${codes[@]}"; do
+    name="backup.$service.$next"
+    envvar="${SERVICE_UC}_BACKUP_${next}"
+    svc=$(svc_for "$name")
+    "$SEC" add-generic-password \
+      -s "$svc" -a "$envvar" -w "$code" -U
+    index_upsert "$name" "$envvar"
+    next=$((next+1))
+    stored=$((stored+1))
+  done
+  echo "stored $stored backup code(s) for $service (require-auth)" >&2
+}
+
+# `backup use` — print and delete the next available code. Atomic single-use:
+# the value is fetched and only printed if the deletion succeeds, so a code
+# can never be both printed and left in the store.
+cmd_backup_use() {
+  [[ $# -ge 1 ]] || { echo "usage: mxkey backup use <service>" >&2; exit 2; }
+  local service="$1"
+  backup_validate_service "$service"
+
+  local first_name
+  first_name=$(backup_codes_for "$service" | head -1)
+  if [[ -z "$first_name" ]]; then
+    echo "error: no backup codes left for $service" >&2
+    echo "hint: regenerate codes at the provider, then 'mxkey backup add $service'" >&2
+    exit 1
+  fi
+
+  local svc val
+  svc=$(svc_for "$first_name")
+  val=$(find_value "$svc") || {
+    echo "error: $svc not found in keychain (index out of sync?)" >&2
+    exit 1
+  }
+
+  # Delete BEFORE printing — if delete fails we abort without revealing the
+  # value, so the next `use` call still has it. Better to fail closed than to
+  # silently double-use a code.
+  if ! "$SEC" delete-generic-password -s "$svc" >/dev/null 2>&1; then
+    echo "error: failed to delete $svc — refusing to print to avoid double-use" >&2
+    exit 1
+  fi
+  index_remove "$first_name"
+
+  printf '%s\n' "$val"
+  local remaining
+  remaining=$(backup_codes_for "$service" | wc -l | tr -d ' ')
+  echo "consumed $first_name; $remaining code(s) remaining" >&2
+}
+
+# `backup list` — show remaining counts. With a service arg, show that service
+# only; otherwise show every service with codes stored.
+cmd_backup_list() {
+  if [[ $# -ge 1 ]]; then
+    local service="$1"
+    backup_validate_service "$service"
+    local count
+    count=$(backup_codes_for "$service" | wc -l | tr -d ' ')
+    printf '%-20s  %s remaining\n' "$service" "$count"
+    return 0
+  fi
+
+  # All services with backup codes — extract the <service> from
+  # backup.<service>.<n> entries in the index, dedupe, then count.
+  local -a services=()
+  local svc
+  while IFS= read -r svc; do
+    [[ -n "$svc" ]] && services+=("$svc")
+  done < <(awk -F'\t' '
+    $1 ~ /^backup\.[^.]+\.[0-9]+$/ {
+      n = split($1, a, ".")
+      print a[2]
+    }
+  ' "$INDEX" | sort -u)
+
+  if [[ ${#services[@]} -eq 0 ]]; then
+    echo "(no backup codes stored)" >&2
+    return 0
+  fi
+
+  printf '%-20s  %s\n' SERVICE REMAINING
+  printf '%-20s  %s\n' "--------------------" "---------"
+  local s count
+  for s in "${services[@]}"; do
+    count=$(backup_codes_for "$s" | wc -l | tr -d ' ')
+    printf '%-20s  %s\n' "$s" "$count"
+  done
+}
+
+# `backup rm` — delete every code for a service. Confirms on a TTY unless -f.
+cmd_backup_rm() {
+  local force=0
+  while [[ $# -gt 0 && "$1" == -* ]]; do
+    case "$1" in
+      -f|--force) force=1; shift ;;
+      --) shift; break ;;
+      *) echo "error: unknown flag $1" >&2; exit 2 ;;
+    esac
+  done
+  [[ $# -ge 1 ]] || { echo "usage: mxkey backup rm [-f|--force] <service>" >&2; exit 2; }
+  local service="$1"
+  backup_validate_service "$service"
+
+  local -a names=()
+  local n
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && names+=("$n")
+  done < <(backup_codes_for "$service")
+
+  if [[ ${#names[@]} -eq 0 ]]; then
+    echo "(no backup codes stored for $service)" >&2
+    return 0
+  fi
+
+  if [[ $force -eq 0 && -t 0 ]]; then
+    printf 'Remove %d backup code(s) for %s? [y/N] ' "${#names[@]}" "$service" >&2
+    local ans
+    read -r ans
+    [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "Aborted." >&2; exit 0; }
+  fi
+
+  local svc removed=0
+  for n in "${names[@]}"; do
+    svc=$(svc_for "$n")
+    "$SEC" delete-generic-password -s "$svc" >/dev/null 2>&1 || true
+    index_remove "$n"
+    removed=$((removed+1))
+  done
+  echo "removed $removed backup code(s) for $service" >&2
+  echo "remember to revoke / regenerate at the provider if these were live" >&2
+}
+
+cmd_backup() {
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    add)   cmd_backup_add  "$@" ;;
+    use)   cmd_backup_use  "$@" ;;
+    list)  cmd_backup_list "$@" ;;
+    rm)    cmd_backup_rm   "$@" ;;
+    ""|-h|--help) cat >&2 <<'EOF'
+mxkey backup — single-use recovery codes
+  add <service>      add codes (paste at hidden prompt, blank line to end)
+  use <service>      print and delete the next available code (atomic)
+  list [service]     show how many codes remain
+  rm <service>       delete every code for a service
+
+Storage: backup.<service>.<n>, always require-auth.
+EOF
+      exit 0 ;;
+    *) echo "unknown backup subcommand: $sub" >&2; exit 2 ;;
+  esac
+}
+
+# ── dispatch ───────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  set)             shift; cmd_set      "$@" ;;
+  get)             shift; cmd_get      "$@" ;;
+  rm|delete)       shift; cmd_rm       "$@" ;;
+  list|ls)         shift; cmd_list     "$@" ;;
+  run)             shift; cmd_run      "$@" ;;
+  run-here|here)   shift; cmd_run_here "$@" ;;
+  init)            shift; cmd_init     "$@" ;;
+  export)          shift; cmd_export   "$@" ;;
+  backup)          shift; cmd_backup   "$@" ;;
+  ""|-h|--help)    usage 0 ;;
+  -v|--version)    echo "mxkey $MXKEY_VERSION"; exit 0 ;;
+  *) echo "unknown command: $1" >&2; usage 2 ;;
+esac
