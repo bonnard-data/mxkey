@@ -32,6 +32,27 @@ mxkey run-here -- pnpm dev                     # loads every project.myapp.* sec
 
 `mxkey --help` is the canonical command reference — covers `set`, `run`, `list`, `rm`, `init`, `run-here`, `export`, plus `mxkey backup` for single-use 2FA recovery codes and `mxkey set --require-auth` for keys that require a Touch ID / password prompt on every read.
 
+## Use as an agent skill
+
+The repo ships with a Claude Code / Cursor / Codex skill (`SKILL.md` plus `references/`) that teaches AI agents to handle secrets safely — migrate `.env` files into Keychain, refuse secrets pasted into chat, suggest `--require-auth` for high-value keys, store 2FA recovery codes as single-use entries, and so on.
+
+**Via Sherpi** (recommended) — install with the [`@sherpi/cli`](https://github.com/bonnard-data/sherpi-cli):
+
+```bash
+sherpi skills install mxkey
+```
+
+Or browse the public Sherpi catalog at [app.sherpi.dev/public/bonnard/mxkey](https://app.sherpi.dev/public/bonnard/mxkey).
+
+**Manual** — symlink the cloned repo into your editor's skills directory:
+
+```bash
+ln -sfn "$(pwd)" ~/.claude/skills/mxkey       # Claude Code
+ln -sfn "$(pwd)" ~/.cursor/skills/mxkey       # Cursor
+```
+
+The skill expects the `mxkey` CLI on `PATH`, so run `bash install.sh` too if you haven't already.
+
 ## Documentation
 
 - [`SKILL.md`](./SKILL.md) — agent skill definition (for Claude Code, Cursor, etc.)
