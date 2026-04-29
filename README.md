@@ -21,6 +21,17 @@ bash install.sh
 
 This symlinks `mxkey` into `~/.local/bin/`. Make sure that's on your `PATH`.
 
+## Usage
+
+For projects with several secrets, declare them once and load them as a group:
+
+```bash
+mxkey init project.myapp                       # writes .env.mxkey listing the names
+mxkey run-here -- pnpm dev                     # loads every project.myapp.* secret
+```
+
+`mxkey --help` is the canonical command reference — covers `set`, `run`, `list`, `rm`, `init`, `run-here`, `export`, plus `mxkey backup` for single-use 2FA recovery codes and `mxkey set --require-auth` for keys that require a Touch ID / password prompt on every read.
+
 ## Documentation
 
 - [`SKILL.md`](./SKILL.md) — agent skill definition (for Claude Code, Cursor, etc.)
