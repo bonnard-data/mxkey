@@ -85,15 +85,20 @@ Project workflow
       and run <command> with every secret it lists loaded.
       Example: mxkey run-here -- pnpm dev
 
-  mxkey migrate [--delete|--keep] <path-to-.env> [project-slug]
+  mxkey migrate [--delete|--keep] [--no-init] <path-to-.env> [project-slug]
       Move every key=value in a .env file into Keychain under
       project.<slug>.* names. Values are piped via stdin so they never
       hit disk or shell history. In-file duplicates are collapsed
       (last value wins). Existing entries are flagged as "overwrites".
-      After a successful migration, prompts to delete the original
-      .env (TTY) — or pass --delete to skip the prompt. --keep skips
-      both the prompt and the trim list. Project slug defaults to
-      the current folder name.
+
+      After a successful migration, by default writes a .env.mxkey
+      manifest in the current folder so `mxkey run-here -- <cmd>` works
+      out of the box. Pass --no-init to skip. Existing manifests are
+      never overwritten.
+
+      Also prompts to delete the original .env (TTY) — pass --delete to
+      skip the prompt, --keep to skip both the prompt and the trim list.
+      Project slug defaults to the current folder name.
       Example: mxkey migrate .env.local myapp
       Example: mxkey migrate --delete .env.local myapp
 
@@ -392,6 +397,32 @@ cmd_run() {
   exec /usr/bin/env "${env_args[@]}" "$@"
 }
 
+# _write_manifest <prefix> <out-path> — write a .env.mxkey-style manifest
+# listing every name matching <prefix>. Caller is responsible for
+# pre-checks (overwrite prompts, etc). Returns 0 on success, 1 if no
+# entries match.
+_write_manifest() {
+  local prefix="$1" out="$2"
+
+  local -a matches=()
+  local n
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && matches+=("$n")
+  done < <(index_match_group "$prefix")
+
+  [[ ${#matches[@]} -gt 0 ]] || return 1
+
+  {
+    printf '# mxkey manifest for %s\n' "$prefix"
+    printf '# Run: mxkey run-here -- <command>\n'
+    printf '# Regenerate any time with: mxkey init %s\n' "$prefix"
+    printf '\n'
+    for n in "${matches[@]}"; do
+      printf '%s\n' "$n"
+    done
+  } > "$out"
+}
+
 # `init` — generate .env.mxkey in the current folder. The manifest is a
 # pointer file: it lists NAMES only (no secret values). The names point
 # back into Keychain; run-here reads this file to know what to inject.
@@ -417,16 +448,10 @@ cmd_init() {
     [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "Aborted." >&2; exit 0; }
   fi
 
-  {
-    printf '# mxkey manifest for %s\n' "$prefix"
-    printf '# Run: mxkey run-here -- <command>\n'
-    printf '# Regenerate any time with: mxkey init %s\n' "$prefix"
-    printf '\n'
-    local n
-    for n in "${matches[@]}"; do
-      printf '%s\n' "$n"
-    done
-  } > "$MANIFEST"
+  _write_manifest "$prefix" "$MANIFEST" || {
+    echo "error: failed to write $MANIFEST" >&2
+    exit 1
+  }
 
   echo "wrote $MANIFEST with ${#matches[@]} name(s):" >&2
   local n
@@ -794,18 +819,19 @@ parse_env_file() {
 }
 
 cmd_migrate() {
-  local delete_after=0 keep_after=0
+  local delete_after=0 keep_after=0 no_init=0
   while [[ $# -gt 0 && "$1" == --* ]]; do
     case "$1" in
-      --delete) delete_after=1; shift ;;
-      --keep)   keep_after=1;   shift ;;
+      --delete)  delete_after=1; shift ;;
+      --keep)    keep_after=1;   shift ;;
+      --no-init) no_init=1;      shift ;;
       --) shift; break ;;
       *) echo "error: unknown flag $1" >&2; exit 2 ;;
     esac
   done
 
   [[ $# -ge 1 ]] || {
-    echo "usage: mxkey migrate [--delete|--keep] <path-to-.env> [project-slug]" >&2
+    echo "usage: mxkey migrate [--delete|--keep] [--no-init] <path-to-.env> [project-slug]" >&2
     exit 2
   }
   local env_file="$1"
@@ -935,39 +961,51 @@ cmd_migrate() {
     return 0
   fi
 
-  echo "" >&2
-  echo "wrap your dev command with: mxkey run project.$project -- <cmd>" >&2
+  # Auto-write .env.mxkey unless --no-init or one already exists.
+  local manifest_written=0
+  if (( ! no_init )) && [[ ! -f "$MANIFEST" ]]; then
+    if _write_manifest "project.$project" "$MANIFEST" 2>/dev/null; then
+      manifest_written=1
+    fi
+  fi
 
-  # Decide what to do with the original .env. Rules:
-  #   --delete      : delete the file outright
-  #   --keep        : keep as-is, just print the trim list
-  #   neither, TTY  : prompt the user
-  #   neither, pipe : keep (safe default), print trim list
+  # Handle the original .env: --delete, --keep, or interactive prompt.
+  local file_deleted=0
   if (( delete_after )); then
-    rm -f "$env_file" && echo "" >&2 && echo "deleted $env_file" >&2
-    return 0
-  fi
-
-  if (( keep_after )) || (( interactive == 0 )); then
+    rm -f "$env_file" && file_deleted=1
+  elif (( ! keep_after )) && (( interactive )); then
     echo "" >&2
-    echo "remove these keys from $env_file (or pass --delete next time):" >&2
-    local k
-    for k in "${migrated_keys[@]}"; do
-      echo "  - $k" >&2
-    done
-    return 0
+    printf 'Delete %s now? [y/N] ' "$env_file" >&2
+    local ans
+    read -r ans
+    if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
+      rm -f "$env_file" && file_deleted=1
+    fi
   fi
+  # else: --keep or non-interactive piped mode — leave file alone
 
-  # Interactive — ask what to do with the file.
+  # Final summary — make the project-group concept explicit.
   echo "" >&2
-  printf 'Delete %s now? [y/N] ' "$env_file" >&2
-  local ans
-  read -r ans
-  if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
-    rm -f "$env_file" && echo "deleted $env_file" >&2
+  local summary="project.$project now contains $migrated secret(s)."
+  if (( manifest_written )); then
+    summary="$summary wrote $MANIFEST."
+  fi
+  if (( file_deleted )); then
+    summary="$summary deleted $env_file."
+  fi
+  echo "$summary" >&2
+
+  echo "" >&2
+  if [[ -f "$MANIFEST" ]]; then
+    echo "  mxkey run-here -- pnpm dev      run with all secrets loaded" >&2
   else
+    echo "  mxkey run project.$project -- pnpm dev      run as a group" >&2
+  fi
+
+  # If the file is still there, remind the user to trim the migrated keys.
+  if (( ! file_deleted )); then
     echo "" >&2
-    echo "keeping $env_file. remove these keys manually:" >&2
+    echo "remove these keys from $env_file:" >&2
     local k
     for k in "${migrated_keys[@]}"; do
       echo "  - $k" >&2
