@@ -41,7 +41,7 @@ set -euo pipefail
 # The index holds names (no values), but fewer prying eyes is still better.
 umask 077
 
-MXKEY_VERSION="0.7.0"
+MXKEY_VERSION="1.0.0"
 PREFIX="mxkey"
 SEC=/usr/bin/security
 INDEX_DIR="$HOME/.config/mxkey"

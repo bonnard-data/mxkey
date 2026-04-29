@@ -14,12 +14,22 @@ macOS only. Single bash script, no dependencies beyond what ships with macOS.
 ## Install
 
 ```bash
+brew install bonnard-data/mxkey/mxkey
+```
+
+The single-line form combines `brew tap` and `brew install`. Future updates land via `brew upgrade mxkey`. The bundled agent skill is installed at `$(brew --prefix)/share/mxkey` — symlink it into your editor to enable:
+
+```bash
+ln -sfn "$(brew --prefix)/share/mxkey" ~/.claude/skills/mxkey
+```
+
+Or build from source:
+
+```bash
 git clone https://github.com/bonnard-data/mxkey.git
 cd mxkey
 bash install.sh
 ```
-
-This symlinks `mxkey` into `~/.local/bin/`. Make sure that's on your `PATH`.
 
 ## Usage
 
@@ -36,22 +46,26 @@ mxkey run-here -- pnpm dev                     # loads every project.myapp.* sec
 
 The repo ships with a Claude Code / Cursor / Codex skill (`SKILL.md` plus `references/`) that teaches AI agents to handle secrets safely — migrate `.env` files into Keychain, refuse secrets pasted into chat, suggest `--require-auth` for high-value keys, store 2FA recovery codes as single-use entries, and so on.
 
-**Via Sherpi** (recommended) — install with the [`@sherpi/cli`](https://github.com/bonnard-data/sherpi-cli):
+**Via Homebrew** — `brew install bonnard-data/mxkey/mxkey` lays the skill down at `$(brew --prefix)/share/mxkey`. Symlink to enable:
+
+```bash
+ln -sfn "$(brew --prefix)/share/mxkey" ~/.claude/skills/mxkey       # Claude Code
+ln -sfn "$(brew --prefix)/share/mxkey" ~/.cursor/skills/mxkey       # Cursor
+```
+
+**From source** — symlink the cloned repo into your editor's skills directory:
+
+```bash
+ln -sfn "$(pwd)" ~/.claude/skills/mxkey
+```
+
+**Via Sherpi** — install with the [`@sherpi/cli`](https://github.com/bonnard-data/sherpi-cli):
 
 ```bash
 sherpi skills install mxkey
 ```
 
 Or browse the public Sherpi catalog at [app.sherpi.dev/public/bonnard/mxkey](https://app.sherpi.dev/public/bonnard/mxkey).
-
-**Manual** — symlink the cloned repo into your editor's skills directory:
-
-```bash
-ln -sfn "$(pwd)" ~/.claude/skills/mxkey       # Claude Code
-ln -sfn "$(pwd)" ~/.cursor/skills/mxkey       # Cursor
-```
-
-The skill expects the `mxkey` CLI on `PATH`, so run `bash install.sh` too if you haven't already.
 
 ## Documentation
 

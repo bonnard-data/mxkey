@@ -1,6 +1,6 @@
 ---
 name: mxkey
-version: 0.6.0
+version: 1.0.0
 description: macOS dev-secrets workflow via mxkey (a Keychain wrapper). Use whenever the user handles an API key, token, password, or 2FA backup / recovery code — setting up a new API, running a command that needs a key, editing a .env file, spotting a hardcoded secret in code, or storing single-use recovery codes. Secrets never enter chat, shell history, or plaintext files. macOS only.
 tags: [secrets, security, macos, keychain, env]
 allowed-tools:
