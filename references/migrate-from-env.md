@@ -13,19 +13,19 @@ by tooling that can't read env vars from the parent process — e.g. Next.js's
 ## The flow
 
 ```bash
-bash migrate-env.sh <path-to-.env> [project-slug]
+mxkey migrate <path-to-.env> [project-slug]
 ```
 
-The script:
+The command:
 
 1. Parses the `.env` (skips comments and blanks, strips `export ` prefix and
    surrounding quotes).
-2. Shows the list of keys with a 4-char preview (so the user can sanity-check
-   the file was parsed correctly, without leaking full values).
-3. Prompts `[y/N]` to confirm migration.
+2. Shows each key with a character count — values are never printed.
+3. Prompts `[y/N]` (non-interactive) or per-key `[Y/n/a/q]` (interactive) to
+   confirm migration.
 4. For each key, pipes the value into `mxkey set project.<slug>.<key_lower> <KEY>`
    via non-TTY stdin. **Values never touch shell history or intermediate files.**
-5. Prints a summary and next steps.
+5. Prints a summary and the list of keys to remove from the original `.env`.
 
 ## Naming result
 

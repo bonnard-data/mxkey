@@ -136,6 +136,7 @@ backup codes the env var is auto-generated as `<SERVICE>_BACKUP_<N>`.
 | `mxkey run <name>... -- <cmd>` | Run `<cmd>` with the named secrets loaded as env vars. A name with no exact match is a group prefix. |
 | `mxkey init <group-prefix>` | Write `.env.mxkey` in the current folder listing every matching name (values stay in Keychain). |
 | `mxkey run-here -- <cmd>` | Walk up to find `.env.mxkey`, run `<cmd>` with every listed secret loaded. |
+| `mxkey migrate <path-to-.env> [project-slug]` | Read a `.env` file and import every key into Keychain under `project.<slug>.*`. Values are piped via stdin so they never touch disk or shell history. |
 | `mxkey list [prefix]` | Show stored names, optionally filtered. |
 | `mxkey rm <name>` | Delete a secret from Keychain. |
 | `mxkey get` / `mxkey export` | Print a value / `ENV_VAR=value`. Escape hatches — prefer `run`. |
@@ -151,10 +152,10 @@ backup codes the env var is auto-generated as `<SERVICE>_BACKUP_<N>`.
 When the agent encounters a `.env`, `.env.local`, or similar in a project:
 
 1. Offer to migrate: "I can move these N keys into mxkey under `project.<repo>.*`."
-2. On approval, run `bash migrate-env.sh <path-to-env>`.
+2. On approval, run `mxkey migrate <path-to-env> <repo>`.
 3. Offer to add `.env*` to `.gitignore`.
 4. After a successful migration, **trim the migrated keys out of `.env`**.
-   The script prints the exact list at the end — remove those lines (or the
+   The command prints the exact list at the end — remove those lines (or the
    whole file if nothing non-secret remains). Leaving both copies means
    secrets still exist in plaintext and the two stores can drift.
 5. Suggest wrapping dev commands: `mxkey run project.<repo> -- <cmd>`, or

@@ -41,7 +41,7 @@ set -euo pipefail
 # The index holds names (no values), but fewer prying eyes is still better.
 umask 077
 
-MXKEY_VERSION="0.6.0"
+MXKEY_VERSION="0.7.0"
 PREFIX="mxkey"
 SEC=/usr/bin/security
 INDEX_DIR="$HOME/.config/mxkey"
@@ -84,6 +84,18 @@ Project workflow
       Find the nearest .env.mxkey (walking up from the current folder)
       and run <command> with every secret it lists loaded.
       Example: mxkey run-here -- pnpm dev
+
+  mxkey migrate [--delete|--keep] <path-to-.env> [project-slug]
+      Move every key=value in a .env file into Keychain under
+      project.<slug>.* names. Values are piped via stdin so they never
+      hit disk or shell history. In-file duplicates are collapsed
+      (last value wins). Existing entries are flagged as "overwrites".
+      After a successful migration, prompts to delete the original
+      .env (TTY) — or pass --delete to skip the prompt. --keep skips
+      both the prompt and the trim list. Project slug defaults to
+      the current folder name.
+      Example: mxkey migrate .env.local myapp
+      Example: mxkey migrate --delete .env.local myapp
 
 Inspect and clean up
   mxkey list [prefix]         Show stored secret names (values stay hidden).
@@ -736,6 +748,233 @@ EOF
   esac
 }
 
+# ── migrate ────────────────────────────────────────────────────────────────
+#
+# `migrate` — read a .env file and import every key=value into Keychain
+# under project.<slug>.<lowercased-key> names. Values are piped to
+# `cmd_set` via non-TTY stdin so they never touch disk, temp files, or
+# shell history.
+
+# parse_env_file <path> — emit "key<TAB>value" lines for each definition
+# in the file. Last-value-wins for in-file duplicates (standard .env
+# semantics). Skips blanks/comments, strips `export ` prefix, strips
+# matching surrounding single or double quotes. Values are not expanded.
+# The number of duplicate lines collapsed is appended as a final
+# "DUPS\t<n>" record so the caller can report it.
+parse_env_file() {
+  awk '
+    /^[[:space:]]*($|#)/ { next }
+    {
+      line = $0
+      sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+      eq = index(line, "=")
+      if (eq == 0) next
+      key = substr(line, 1, eq - 1)
+      val = substr(line, eq + 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      if (val ~ /^".*"$/) val = substr(val, 2, length(val) - 2)
+      else if (val ~ /^'"'"'.*'"'"'$/) val = substr(val, 2, length(val) - 2)
+      if (key == "") next
+      if (!(key in seen)) {
+        order[++n] = key
+        seen[key] = 1
+      } else {
+        dup_count++
+      }
+      pairs[key] = val
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        k = order[i]
+        print k "\t" pairs[k]
+      }
+      print "DUPS\t" (dup_count + 0)
+    }
+  ' "$1"
+}
+
+cmd_migrate() {
+  local delete_after=0 keep_after=0
+  while [[ $# -gt 0 && "$1" == --* ]]; do
+    case "$1" in
+      --delete) delete_after=1; shift ;;
+      --keep)   keep_after=1;   shift ;;
+      --) shift; break ;;
+      *) echo "error: unknown flag $1" >&2; exit 2 ;;
+    esac
+  done
+
+  [[ $# -ge 1 ]] || {
+    echo "usage: mxkey migrate [--delete|--keep] <path-to-.env> [project-slug]" >&2
+    exit 2
+  }
+  local env_file="$1"
+  local project="${2:-$(basename "$PWD")}"
+
+  [[ -f "$env_file" ]] || {
+    echo "error: $env_file does not exist" >&2; exit 1;
+  }
+
+  echo "Project slug: $project" >&2
+  echo "Reading: $env_file" >&2
+  echo "" >&2
+
+  # Read parser output. The trailing DUPS record reports collapsed dupes.
+  local -a pairs=()
+  local dup_count=0
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "DUPS"$'\t'* ]]; then
+      dup_count="${line#DUPS	}"
+    else
+      pairs+=("$line")
+    fi
+  done < <(parse_env_file "$env_file")
+
+  if [[ ${#pairs[@]} -eq 0 ]]; then
+    echo "no key=value pairs found in $env_file" >&2
+    exit 0
+  fi
+
+  # Pre-flight: count entries that already exist in the index — these
+  # will be overwritten by the migration. The user should know first.
+  local overwrite_count=0
+  local p key val lower_key name
+  local -a marker=()
+  for p in "${pairs[@]}"; do
+    key="${p%%	*}"
+    lower_key="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+    name="project.$project.$lower_key"
+    if index_lookup "$name" >/dev/null 2>&1; then
+      marker+=("[overwrites existing]")
+      overwrite_count=$((overwrite_count + 1))
+    else
+      marker+=("")
+    fi
+  done
+
+  # Summary header — values are never printed.
+  if (( dup_count > 0 )); then
+    echo "Found ${#pairs[@]} unique key(s) ($dup_count in-file duplicate(s) collapsed; last value wins):" >&2
+  else
+    echo "Found ${#pairs[@]} key(s):" >&2
+  fi
+  local i=0
+  for p in "${pairs[@]}"; do
+    key="${p%%	*}"
+    val="${p#*	}"
+    if [[ -n "${marker[i]}" ]]; then
+      printf '  %s  (%d chars) %s\n' "$key" "${#val}" "${marker[i]}" >&2
+    else
+      printf '  %s  (%d chars)\n' "$key" "${#val}" >&2
+    fi
+    i=$((i + 1))
+  done
+  if (( overwrite_count > 0 )); then
+    echo "" >&2
+    echo "$overwrite_count entry(s) already exist in Keychain and will be overwritten." >&2
+  fi
+  echo "" >&2
+
+  # Interactive (TTY) → per-key prompts. Non-interactive → single batch
+  # confirm. Either way, no value is ever shown.
+  local interactive=0
+  [[ -t 0 ]] && interactive=1
+
+  if [[ $interactive -eq 0 ]]; then
+    printf 'Migrate all of these under project.%s.* ? [y/N] ' "$project" >&2
+    local ans
+    read -r ans
+    printf '\n' >&2
+    [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "aborted" >&2; exit 0; }
+  else
+    echo "Review each key [Y=migrate / n=skip / a=all remaining / q=quit]:" >&2
+    echo "" >&2
+  fi
+
+  local migrated=0 skipped=0 migrate_rest=0
+  local -a migrated_keys=()
+
+  for p in "${pairs[@]}"; do
+    key="${p%%	*}"
+    val="${p#*	}"
+    lower_key="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+    name="project.$project.$lower_key"
+
+    if [[ -z "$val" ]]; then
+      echo "  SKIP $key (empty value)" >&2
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    if [[ $interactive -eq 1 && $migrate_rest -eq 0 ]]; then
+      printf '  %s → %s (%d chars) [Y/n/a/q]: ' "$key" "$name" "${#val}" >&2
+      local ans
+      read -r ans
+      case "$ans" in
+        n|N) echo "  SKIP $key" >&2; skipped=$((skipped + 1)); continue ;;
+        a|A) migrate_rest=1 ;;
+        q|Q) echo "  quit — stopping" >&2; break ;;
+        *) ;;  # default: yes
+      esac
+    fi
+
+    # Pipe value into cmd_set. The pipe makes stdin non-TTY, so cmd_set
+    # reads via `cat` instead of prompting. Value never lands on disk.
+    # Both stdout and stderr are suppressed so we control the output.
+    printf '%s' "$val" | cmd_set "$name" "$key" >/dev/null 2>&1
+    echo "  set project.$project.$lower_key  ($key)" >&2
+    migrated_keys+=("$key")
+    migrated=$((migrated + 1))
+  done
+
+  echo "" >&2
+  echo "migrated $migrated / ${#pairs[@]} secrets. skipped: $skipped" >&2
+
+  if (( migrated == 0 )); then
+    return 0
+  fi
+
+  echo "" >&2
+  echo "wrap your dev command with: mxkey run project.$project -- <cmd>" >&2
+
+  # Decide what to do with the original .env. Rules:
+  #   --delete      : delete the file outright
+  #   --keep        : keep as-is, just print the trim list
+  #   neither, TTY  : prompt the user
+  #   neither, pipe : keep (safe default), print trim list
+  if (( delete_after )); then
+    rm -f "$env_file" && echo "" >&2 && echo "deleted $env_file" >&2
+    return 0
+  fi
+
+  if (( keep_after )) || (( interactive == 0 )); then
+    echo "" >&2
+    echo "remove these keys from $env_file (or pass --delete next time):" >&2
+    local k
+    for k in "${migrated_keys[@]}"; do
+      echo "  - $k" >&2
+    done
+    return 0
+  fi
+
+  # Interactive — ask what to do with the file.
+  echo "" >&2
+  printf 'Delete %s now? [y/N] ' "$env_file" >&2
+  local ans
+  read -r ans
+  if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
+    rm -f "$env_file" && echo "deleted $env_file" >&2
+  else
+    echo "" >&2
+    echo "keeping $env_file. remove these keys manually:" >&2
+    local k
+    for k in "${migrated_keys[@]}"; do
+      echo "  - $k" >&2
+    done
+  fi
+}
+
 # ── dispatch ───────────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -746,6 +985,7 @@ case "${1:-}" in
   run)             shift; cmd_run      "$@" ;;
   run-here|here)   shift; cmd_run_here "$@" ;;
   init)            shift; cmd_init     "$@" ;;
+  migrate)         shift; cmd_migrate  "$@" ;;
   export)          shift; cmd_export   "$@" ;;
   backup)          shift; cmd_backup   "$@" ;;
   ""|-h|--help)    usage 0 ;;
