@@ -1,0 +1,63 @@
+name: Release
+
+# Tag-driven release workflow.
+# On push of a v*.*.* tag, build a release tarball, sign it with
+# SLSA build provenance via Sigstore, and attach both to a new
+# GitHub release. Homebrew formulae and other downstream consumers
+# can verify provenance with `gh attestation verify`.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write       # create the GitHub release
+  attestations: write   # write the provenance attestation
+  id-token: write       # required by Sigstore for OIDC
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release tarball
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          STAGE="mxkey-${VERSION}"
+          mkdir -p "${STAGE}"
+          # Copy the user-facing surface only — exclude dev/CI noise.
+          cp -R \
+            mxkey \
+            install.sh \
+            SKILL.md \
+            LICENSE \
+            README.md \
+            references \
+            assets \
+            "${STAGE}/"
+          tar -czf "${STAGE}.tar.gz" "${STAGE}"
+          shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          cat "${STAGE}.tar.gz.sha256"
+
+      - name: Generate SLSA provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'mxkey-${{ steps.version.outputs.version }}.tar.gz'
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --generate-notes \
+            "mxkey-${VERSION}.tar.gz" \
+            "mxkey-${VERSION}.tar.gz.sha256"
